@@ -1,4 +1,9 @@
 {
+  "burst_merge_window_ms": {
+    "description": "Maximum gap in milliseconds for grouping consecutive messages from the same sender.",
+    "type": "int",
+    "default": 12000
+  },
   "accounts": {
     "description": "QQ account mappings for source/clone observation.",
     "type": "template_list",

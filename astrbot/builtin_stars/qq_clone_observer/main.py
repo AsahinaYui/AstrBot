@@ -20,6 +20,10 @@ from astrbot.core import logger
 from astrbot.core.platform.astrbot_message import MessageDirection
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+from ._conversation import (
+    _build_conversation_schema,
+    _rebuild_conversation_for_normalized,
+)
 from ._normalized import (
     _build_normalized_schema,
     _normalize_stored_raw_event,
@@ -27,6 +31,7 @@ from ._normalized import (
 
 _PARSER_VERSION = "0.1.0"
 _DB_FILENAME = "raw_events.db"
+_DEFAULT_BURST_WINDOW_MS = 12000
 
 
 def _safe_json_serialize(obj: Any, max_depth: int = 10) -> str:
@@ -160,6 +165,8 @@ def _build_schema(cursor: sqlite3.Cursor) -> None:
     """)
 
     _build_normalized_schema(cursor)
+
+    _build_conversation_schema(cursor)
 
 
 def _insert_raw_event(
@@ -317,6 +324,37 @@ def _find_raw_event_id(conn: sqlite3.Connection, idempotency_key: str) -> int | 
     return int(row[0]) if row is not None else None
 
 
+def _normalize_and_rebuild_stored_event(
+    conn: sqlite3.Connection,
+    raw_event_id: int,
+    burst_window_ms: int,
+    require_new_normalized: bool,
+) -> None:
+    """Normalize a stored raw event and rebuild its derived conversation.
+
+    Args:
+        conn: SQLite connection.
+        raw_event_id: Immutable raw event row ID.
+        burst_window_ms: Maximum same-sender burst gap in milliseconds.
+        require_new_normalized: Whether an existing normalized row is an error.
+
+    Raises:
+        sqlite3.IntegrityError: If a new normalized row was required but the
+            raw event had already been normalized.
+        ValueError: If normalization did not produce a stored normalized row.
+    """
+    inserted = _normalize_stored_raw_event(conn, raw_event_id)
+    if require_new_normalized and not inserted:
+        raise sqlite3.IntegrityError("normalized row already exists for new raw event")
+    row = conn.execute(
+        "SELECT id FROM normalized_events WHERE raw_event_id = ?",
+        (raw_event_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("normalized event not found after normalization")
+    _rebuild_conversation_for_normalized(conn, int(row[0]), burst_window_ms)
+
+
 class QQCloneObserver(Star):
     """Observes raw message events from configured source/clone QQ accounts.
 
@@ -330,6 +368,17 @@ class QQCloneObserver(Star):
         self._config = config if config is not None else AstrBotConfig()
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        configured_window = self._config.get(
+            "burst_merge_window_ms",
+            _DEFAULT_BURST_WINDOW_MS,
+        )
+        self._burst_window_ms = (
+            configured_window
+            if isinstance(configured_window, int)
+            and not isinstance(configured_window, bool)
+            and configured_window >= 0
+            else _DEFAULT_BURST_WINDOW_MS
+        )
 
         # In-memory health state per platform_id
         self._health: dict[str, dict[str, Any]] = {}
@@ -611,9 +660,11 @@ class QQCloneObserver(Star):
                     try:
                         await loop.run_in_executor(
                             None,
-                            _normalize_stored_raw_event,
+                            _normalize_and_rebuild_stored_event,
                             self._conn,
                             raw_event_id,
+                            self._burst_window_ms,
+                            False,
                         )
                     except Exception as e:
                         error_text = type(e).__name__
@@ -667,9 +718,11 @@ class QQCloneObserver(Star):
                         try:
                             await loop.run_in_executor(
                                 None,
-                                _normalize_stored_raw_event,
+                                _normalize_and_rebuild_stored_event,
                                 self._conn,
                                 existing_raw_event_id,
+                                self._burst_window_ms,
+                                False,
                             )
                         except Exception as e:
                             error_text = type(e).__name__
@@ -704,16 +757,14 @@ class QQCloneObserver(Star):
             # Normalize immediately after raw insert succeeds
             try:
                 loop = asyncio.get_running_loop()
-                inserted = await loop.run_in_executor(
+                await loop.run_in_executor(
                     None,
-                    _normalize_stored_raw_event,
+                    _normalize_and_rebuild_stored_event,
                     self._conn,
                     raw_event_id,
+                    self._burst_window_ms,
+                    True,
                 )
-                if not inserted:
-                    raise sqlite3.IntegrityError(
-                        "normalized row already exists for new raw event"
-                    )
             except Exception as e:
                 error_text = type(e).__name__
                 logger.error(
