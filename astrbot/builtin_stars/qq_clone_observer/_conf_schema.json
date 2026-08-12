@@ -1,4 +1,9 @@
 {
+  "shadow_enabled": {
+    "description": "Generate local review-only drafts for incoming clone-account messages. Drafts are never sent automatically.",
+    "type": "bool",
+    "default": false
+  },
   "burst_merge_window_ms": {
     "description": "Maximum gap in milliseconds for grouping consecutive messages from the same sender.",
     "type": "int",

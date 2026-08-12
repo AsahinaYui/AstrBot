@@ -1,5 +1,5 @@
 name: qq_clone_observer
-desc: QQClone passive observer - captures raw events for source/clone QQ accounts.
+desc: QQClone local MVP - learns verified replies and creates review-only shadow drafts.
 author: AstrBot Team
-version: 0.1.0
+version: 0.2.0
 reserved: true

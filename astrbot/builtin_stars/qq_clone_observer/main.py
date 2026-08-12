@@ -1,8 +1,8 @@
 """QQClone passive observer plugin.
 
 Observes raw message events from configured source/clone QQ accounts and
-persists them to a plugin-owned SQLite database. This plugin is observation-only
-and never sends messages or calls external services.
+persists them to a plugin-owned SQLite database. It can learn verified source
+replies and generate local shadow drafts, but never dispatches them.
 """
 
 import asyncio
@@ -14,15 +14,25 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star
 from astrbot.core import logger
 from astrbot.core.platform.astrbot_message import MessageDirection
+from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from ._conversation import (
     _build_conversation_schema,
     _rebuild_conversation_for_normalized,
+)
+from ._mvp import (
+    _build_mvp_schema,
+    _capture_human_example,
+    _get_persona_profile,
+    _list_shadow_drafts,
+    _prepare_shadow_request,
+    _review_shadow_draft,
+    _store_shadow_draft,
 )
 from ._normalized import (
     _build_normalized_schema,
@@ -167,6 +177,8 @@ def _build_schema(cursor: sqlite3.Cursor) -> None:
     _build_normalized_schema(cursor)
 
     _build_conversation_schema(cursor)
+
+    _build_mvp_schema(cursor)
 
 
 def _insert_raw_event(
@@ -329,7 +341,7 @@ def _normalize_and_rebuild_stored_event(
     raw_event_id: int,
     burst_window_ms: int,
     require_new_normalized: bool,
-) -> None:
+) -> int:
     """Normalize a stored raw event and rebuild its derived conversation.
 
     Args:
@@ -337,6 +349,9 @@ def _normalize_and_rebuild_stored_event(
         raw_event_id: Immutable raw event row ID.
         burst_window_ms: Maximum same-sender burst gap in milliseconds.
         require_new_normalized: Whether an existing normalized row is an error.
+
+    Returns:
+        Stored normalized event row ID.
 
     Raises:
         sqlite3.IntegrityError: If a new normalized row was required but the
@@ -352,15 +367,17 @@ def _normalize_and_rebuild_stored_event(
     ).fetchone()
     if row is None:
         raise ValueError("normalized event not found after normalization")
-    _rebuild_conversation_for_normalized(conn, int(row[0]), burst_window_ms)
+    normalized_event_id = int(row[0])
+    _rebuild_conversation_for_normalized(conn, normalized_event_id, burst_window_ms)
+    _capture_human_example(conn, normalized_event_id)
+    return normalized_event_id
 
 
 class QQCloneObserver(Star):
     """Observes raw message events from configured source/clone QQ accounts.
 
-    This plugin is observation-only. It persists raw events to a plugin-owned
-    SQLite database and tracks in-memory health state for each configured
-    account. It never sends messages or calls external services.
+    It persists observed facts and produces reviewable shadow drafts. It never
+    dispatches a draft or calls an outbound platform action.
     """
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -379,6 +396,7 @@ class QQCloneObserver(Star):
             and configured_window >= 0
             else _DEFAULT_BURST_WINDOW_MS
         )
+        self._shadow_enabled = self._config.get("shadow_enabled", False) is True
 
         # In-memory health state per platform_id
         self._health: dict[str, dict[str, Any]] = {}
@@ -444,6 +462,108 @@ class QQCloneObserver(Star):
         """
         # Return a shallow copy to prevent mutation
         return {pid: dict(state) for pid, state in self._health.items()}
+
+    def _source_account(self) -> tuple[str, str] | None:
+        """Return the only enabled source account when unambiguous.
+
+        Returns:
+            Source platform and self ID, or None for zero/multiple sources.
+        """
+        accounts = self._config.get("accounts", [])
+        if not isinstance(accounts, list):
+            return None
+        sources = [
+            (str(item.get("platform_id", "")), str(item.get("self_id", "")))
+            for item in accounts
+            if isinstance(item, dict)
+            and item.get("enabled", True)
+            and item.get("role", "source") == "source"
+            and item.get("platform_id")
+            and item.get("self_id")
+        ]
+        return sources[0] if len(sources) == 1 else None
+
+    async def _generate_shadow_draft(
+        self,
+        normalized_event_id: int,
+        unified_msg_origin: str,
+    ) -> None:
+        """Generate and persist a shadow draft without sending it.
+
+        Args:
+            normalized_event_id: Incoming clone normalized event row ID.
+            unified_msg_origin: Clone conversation origin for provider routing.
+        """
+        source = self._source_account()
+        if not self._shadow_enabled or source is None:
+            return
+
+        async with self._lock:
+            if self._conn is None:
+                return
+            request = await asyncio.to_thread(
+                _prepare_shadow_request,
+                self._conn,
+                normalized_event_id,
+                source[0],
+                source[1],
+            )
+        if request is None:
+            return
+
+        provider = self.context.get_using_provider(umo=unified_msg_origin)
+        provider_id = None
+        model_name = None
+        draft_text = None
+        error_type = None
+        if provider is None:
+            error_type = "ProviderUnavailable"
+        else:
+            meta = provider.meta()
+            provider_id = meta.id
+            model_name = meta.model
+            prompt = json.dumps(
+                {
+                    "recent_conversation": request["recent_messages"],
+                    "authentic_examples": request["examples"],
+                    "incoming_message": request["incoming_text"],
+                },
+                ensure_ascii=False,
+            )
+            try:
+                response = await provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=(
+                        "你在生成一条仅供人工审核的 QQ Shadow 回复。参考真实回复样本"
+                        "和风格摘要，输出一条自然、简短的候选回复。不要解释，不要添加"
+                        "引号，不要声称已执行任何操作。风格摘要："
+                        + request["persona_summary"]
+                    ),
+                )
+                draft_text = (response.completion_text or "").strip()[:2000]
+                if not draft_text:
+                    error_type = "EmptyResponse"
+            except Exception as exc:
+                error_type = type(exc).__name__
+                logger.warning(
+                    "QQCloneObserver: shadow generation failed for normalized_id=%s: %s",
+                    normalized_event_id,
+                    error_type,
+                )
+
+        async with self._lock:
+            if self._conn is not None:
+                await asyncio.to_thread(
+                    _store_shadow_draft,
+                    self._conn,
+                    request,
+                    source[0],
+                    source[1],
+                    provider_id,
+                    model_name,
+                    draft_text,
+                    error_type,
+                )
 
     def _resolve_account_role(
         self,
@@ -564,6 +684,11 @@ class QQCloneObserver(Star):
                     rejection_reason,
                 )
             return
+
+        # Configured QQClone accounts never enter AstrBot's normal reply
+        # pipeline. Administrators use the review commands from another local
+        # AstrBot surface, such as WebChat.
+        event.stop_event()
 
         # Extract event metadata
         direction = getattr(message_obj, "direction", MessageDirection.UNKNOWN)
@@ -755,9 +880,10 @@ class QQCloneObserver(Star):
                 return
 
             # Normalize immediately after raw insert succeeds
+            normalized_event_id = None
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
+                normalized_event_id = await loop.run_in_executor(
                     None,
                     _normalize_and_rebuild_stored_event,
                     self._conn,
@@ -785,6 +911,123 @@ class QQCloneObserver(Star):
                 health["accepted_count"] += 1
                 health["last_event_time"] = time.time()
                 health["observed_self_id"] = self_id
+
+        if (
+            normalized_event_id is not None
+            and role == "clone"
+            and direction_str == "incoming"
+        ):
+            await self._generate_shadow_draft(
+                normalized_event_id,
+                event.unified_msg_origin,
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("qqclone_drafts")
+    async def qqclone_drafts(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 5,
+    ) -> None:
+        """List recent shadow drafts for administrator review.
+
+        Args:
+            event: Administrator command event.
+            limit: Maximum drafts to display, capped at 20.
+        """
+        async with self._lock:
+            if self._conn is None:
+                event.set_result(
+                    MessageEventResult().message("QQClone 数据库未初始化。")
+                )
+                return
+            drafts = await asyncio.to_thread(
+                _list_shadow_drafts,
+                self._conn,
+                limit,
+            )
+        if not drafts:
+            text = "暂无 Shadow 草稿。"
+        else:
+            lines = ["QQClone Shadow 草稿："]
+            for draft in drafts:
+                content = draft["edited_text"] or draft["draft_text"] or ""
+                if draft["error_type"]:
+                    content = f"生成失败：{draft['error_type']}"
+                lines.append(f"#{draft['id']} [{draft['status']}] {content[:160]}")
+            lines.append("使用 /qqclone_review <ID> approved|rejected|edited [新文本]")
+            text = "\n".join(lines)
+        event.set_result(MessageEventResult().message(text).use_t2i(False))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("qqclone_review")
+    async def qqclone_review(
+        self,
+        event: AstrMessageEvent,
+        draft_id: int,
+        decision: GreedyStr,
+    ) -> None:
+        """Approve, edit, or reject a draft without sending it.
+
+        Args:
+            event: Administrator command event.
+            draft_id: Shadow draft ID.
+            decision: Status followed by replacement text for edited decisions.
+        """
+        status, _, edited_text = str(decision).partition(" ")
+        try:
+            async with self._lock:
+                if self._conn is None:
+                    result = None
+                else:
+                    result = await asyncio.to_thread(
+                        _review_shadow_draft,
+                        self._conn,
+                        draft_id,
+                        status,
+                        edited_text or None,
+                    )
+        except ValueError as exc:
+            event.set_result(MessageEventResult().message(str(exc)))
+            return
+        message = (
+            f"草稿 #{draft_id} 已标记为 {status}；不会自动发送。"
+            if result
+            else f"未找到待审核草稿 #{draft_id}。"
+        )
+        event.set_result(MessageEventResult().message(message))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("qqclone_persona")
+    async def qqclone_persona(
+        self,
+        event: AstrMessageEvent,
+        source_platform_id: str | None = None,
+    ) -> None:
+        """Show the deterministic persona summary built from verified replies.
+
+        Args:
+            event: Administrator command event.
+            source_platform_id: Optional configured source platform ID.
+        """
+        async with self._lock:
+            if self._conn is None:
+                profile = None
+            else:
+                profile = await asyncio.to_thread(
+                    _get_persona_profile,
+                    self._conn,
+                    source_platform_id,
+                )
+        if profile is None:
+            text = "暂无已验证的人类回复样本。"
+        else:
+            text = (
+                f"来源：{profile['platform_id']} / {profile['self_id']}\n"
+                f"样本数：{profile['sample_count']}\n"
+                f"摘要：{profile['summary_text']}"
+            )
+        event.set_result(MessageEventResult().message(text).use_t2i(False))
 
     async def _check_duplicate_by_event_id(
         self,
