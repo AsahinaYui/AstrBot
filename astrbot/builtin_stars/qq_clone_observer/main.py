@@ -20,6 +20,12 @@ from astrbot.core import logger
 from astrbot.core.platform.astrbot_message import MessageDirection
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+from ._normalized import (
+    _build_normalized_schema,
+    _insert_normalized_event,
+    _normalize_event,
+)
+
 _PARSER_VERSION = "0.1.0"
 _DB_FILENAME = "raw_events.db"
 
@@ -154,6 +160,8 @@ def _build_schema(cursor: sqlite3.Cursor) -> None:
         END;
     """)
 
+    _build_normalized_schema(cursor)
+
 
 def _insert_raw_event(
     conn: sqlite3.Connection,
@@ -169,7 +177,7 @@ def _insert_raw_event(
     payload_sha256: str,
     stable_fingerprint: str,
     idempotency_key: str,
-) -> bool:
+) -> int | None:
     """Insert a raw event row, ignoring duplicates.
 
     Uses INSERT OR IGNORE so that duplicate rows (enforced by UNIQUE
@@ -191,7 +199,7 @@ def _insert_raw_event(
         idempotency_key: Key selected from the highest available identity tier.
 
     Returns:
-        True if a row was inserted, False if duplicate was ignored.
+        The row ID if a new row was inserted, None if duplicate was ignored.
     """
     cursor = conn.execute(
         "INSERT OR IGNORE INTO raw_events "
@@ -219,7 +227,7 @@ def _insert_raw_event(
         ),
     )
     conn.commit()
-    return cursor.rowcount == 1
+    return cursor.lastrowid if cursor.rowcount == 1 else None
 
 
 def _check_existing_by_event_id(
@@ -322,6 +330,7 @@ class QQCloneObserver(Star):
         )
         await asyncio.to_thread(self._conn.execute, "PRAGMA journal_mode=WAL")
         await asyncio.to_thread(self._conn.execute, "PRAGMA busy_timeout=5000")
+        await asyncio.to_thread(self._conn.execute, "PRAGMA foreign_keys=ON")
         await asyncio.to_thread(_build_schema, self._conn.cursor())
 
         # Rebuild health state from configuration
@@ -581,7 +590,7 @@ class QQCloneObserver(Star):
             # Persist to SQLite via executor
             try:
                 loop = asyncio.get_running_loop()
-                inserted = await loop.run_in_executor(
+                raw_event_id = await loop.run_in_executor(
                     None,
                     _insert_raw_event,
                     self._conn,
@@ -598,7 +607,7 @@ class QQCloneObserver(Star):
                     stable_fingerprint,
                     idempotency_key,
                 )
-                if not inserted:
+                if raw_event_id is None:
                     # DB-level duplicate (race condition safety net)
                     health = self._health.get(platform_id)
                     if health:
@@ -616,6 +625,41 @@ class QQCloneObserver(Star):
                     health["rejected_count"] += 1
                     health["last_rejection_or_error"] = str(e)
                 return
+
+            # Normalize immediately after raw insert succeeds
+            try:
+                loop = asyncio.get_running_loop()
+                normalized = await loop.run_in_executor(
+                    None,
+                    _normalize_event,
+                    raw_event_id,
+                    platform_id,
+                    self_id,
+                    role,
+                    source_event_type,
+                    source_event_id,
+                    source_message_id,
+                    direction_str,
+                    provenance,
+                    message_obj,
+                    raw_message,
+                )
+                await loop.run_in_executor(
+                    None,
+                    _insert_normalized_event,
+                    self._conn,
+                    normalized,
+                )
+            except Exception as e:
+                logger.error(
+                    "QQCloneObserver: failed to normalize event (raw_id=%s): %s",
+                    raw_event_id,
+                    e,
+                )
+                # Record error in health but raw row is preserved
+                health = self._health.get(platform_id)
+                if health:
+                    health["last_rejection_or_error"] = f"normalization_error: {e}"
 
             # Update health state
             health = self._health.get(platform_id)
