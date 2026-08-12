@@ -1,0 +1,5 @@
+name: qq_clone_observer
+desc: QQClone passive observer - captures raw events for source/clone QQ accounts.
+author: AstrBot Team
+version: 0.1.0
+reserved: true

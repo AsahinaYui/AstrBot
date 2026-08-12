@@ -1,0 +1,37 @@
+{
+  "accounts": {
+    "description": "QQ account mappings for source/clone observation.",
+    "type": "template_list",
+    "templates": {
+      "qq_account": {
+        "name": "QQ Account",
+        "hint": "Map a QQ platform instance to a source or clone role.",
+        "display_item": "platform_id",
+        "hide_hint_in_list": true,
+        "items": {
+          "platform_id": {
+            "description": "AstrBot platform instance ID (e.g. aiocqhttp_myqq).",
+            "type": "string",
+            "hint": "Must match event.get_platform_id()."
+          },
+          "self_id": {
+            "description": "Expected QQ self ID (bot QQ number).",
+            "type": "string",
+            "hint": "Must match event.get_self_id()."
+          },
+          "role": {
+            "description": "Account role: source (the account being cloned) or clone (the clone account).",
+            "type": "string",
+            "options": ["source", "clone"],
+            "default": "source"
+          },
+          "enabled": {
+            "description": "Enable event collection for this account.",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  }
+}
