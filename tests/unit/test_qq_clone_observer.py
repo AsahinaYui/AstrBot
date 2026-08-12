@@ -28,6 +28,7 @@ from astrbot.builtin_stars.qq_clone_observer._normalized import (
     _normalize_raw_segments,
     _normalize_segment,
     _normalize_segments,
+    _normalize_stored_raw_event,
 )
 from astrbot.builtin_stars.qq_clone_observer.main import (
     QQCloneObserver,
@@ -786,6 +787,7 @@ class TestNormalizedSchema:
     def conn(self, tmp_path: Path) -> sqlite3.Connection:
         conn = sqlite3.connect(str(tmp_path / "test_normalized.db"))
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         _build_schema(conn.cursor())
         _build_normalized_schema(conn.cursor())
         from astrbot.builtin_stars.qq_clone_observer.main import _insert_raw_event
@@ -806,6 +808,30 @@ class TestNormalizedSchema:
             "key1",
         )
         return conn
+
+    def test_orphan_normalized_row_rejected(self, conn: sqlite3.Connection):
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            conn.execute(
+                "INSERT INTO normalized_events "
+                "(raw_event_id, parser_version, platform_id, self_id, "
+                "account_role, conversation_type, conversation_id, direction, "
+                "actor_provenance, normalized_segments_json, "
+                "normalized_processing_time) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    999,
+                    "0.1.0",
+                    "p1",
+                    "bot1",
+                    "source",
+                    "unknown",
+                    "p1:bot1:u:unknown",
+                    "unknown",
+                    "unknown",
+                    "[]",
+                    "1000",
+                ),
+            )
 
     def test_normalized_table_exists(self, conn: sqlite3.Connection):
         cursor = conn.execute(
@@ -1127,6 +1153,46 @@ class TestNormalizedSegmentConversion:
             }
         ]
 
+    def test_mixed_raw_segments_preserve_order_and_extensions(self):
+        raw_segments = [
+            {"type": "text", "data": {"text": "hello"}},
+            {"type": "at", "data": {"qq": "123"}},
+            {"type": "reply", "data": {"id": "456"}},
+            {"type": "image", "data": {"file": "a.jpg"}},
+            {"type": "record", "data": {"file": "a.amr"}},
+            {"type": "audio", "data": {"file": "a.wav"}},
+            {"type": "video", "data": {"file": "a.mp4"}},
+            {"type": "file", "data": {"name": "a.txt"}},
+            {"type": "json", "data": {"data": "{}"}},
+            {"type": "xml", "data": {"data": "<msg/>"}},
+            {"type": "forward", "data": {"id": "forward_1"}},
+            {"type": "node", "data": {"id": "node_1"}},
+            {
+                "type": "napcat_extension",
+                "data": {"value": 42},
+                "extension_field": "kept",
+            },
+        ]
+
+        normalized = _normalize_raw_segments({"message": raw_segments})
+
+        assert [segment["kind"] for segment in normalized] == [
+            "text",
+            "at",
+            "reply",
+            "image",
+            "record",
+            "audio",
+            "video",
+            "file",
+            "json",
+            "xml",
+            "forward",
+            "node",
+            "unknown",
+        ]
+        assert normalized[-1]["data"]["original_segment"] == raw_segments[-1]
+
 
 class TestConversationTypeDerivation:
     """Tests for _derive_conversation_type."""
@@ -1192,7 +1258,7 @@ class TestConversationIdBuilding:
         msg = MagicMock(spec=AstrBotMessage)
         msg.group = None
         cid = _build_conversation_id("p1", "bot1", "group", msg, {})
-        assert cid == "p1:bot1:g:unknown"
+        assert cid == "p1:bot1:u:unknown"
 
     def test_private_incoming_conversation_id(self):
         msg = MagicMock(spec=AstrBotMessage)
@@ -1215,7 +1281,7 @@ class TestConversationIdBuilding:
         msg.direction = MessageDirection.UNKNOWN
         msg.sender = None
         cid = _build_conversation_id("p1", "bot1", "private", msg, {})
-        assert cid == "p1:bot1:p:unknown"
+        assert cid == "p1:bot1:u:unknown"
 
     def test_unknown_conversation_id(self):
         msg = MagicMock(spec=AstrBotMessage)
@@ -1246,7 +1312,16 @@ class TestConversationIdBuilding:
         msg.direction = MessageDirection.OUTGOING
         msg.sender = MessageMember(user_id="sender_001")
         cid = _build_conversation_id("p1", "bot1", "private", msg, {"other": "val"})
-        assert cid == "p1:bot1:p:unknown"
+        assert cid == "p1:bot1:u:unknown"
+
+    def test_delimiter_values_do_not_collide_across_accounts(self):
+        msg = MagicMock(spec=AstrBotMessage)
+        msg.group = Group(group_id="g:1")
+
+        first = _build_conversation_id("a:b", "c", "group", msg, {})
+        second = _build_conversation_id("a", "b:c", "group", msg, {})
+
+        assert first != second
 
 
 class TestActorProvenance:
@@ -1607,24 +1682,21 @@ class TestNormalizeEvent:
 
         msg = self._make_message_obj(segments=[Plain(text="hello")])
         raw = {"message_type": "private", "time": 1000}
-        kwargs = dict(
-            raw_event_id=1,
-            platform_id="p1",
-            self_id="bot1",
-            account_role="source",
-            source_event_type="message",
-            source_event_id="evt_001",
-            source_message_id="msg_001",
-            direction="incoming",
-            provenance="qq",
-            message_obj=msg,
-            raw_message=raw,
-        )
+        kwargs = {
+            "raw_event_id": 1,
+            "platform_id": "p1",
+            "self_id": "bot1",
+            "account_role": "source",
+            "source_event_type": "message",
+            "source_event_id": "evt_001",
+            "source_message_id": "msg_001",
+            "direction": "incoming",
+            "provenance": "qq",
+            "message_obj": msg,
+            "raw_message": raw,
+        }
         result1 = _normalize_event(**kwargs)
         result2 = _normalize_event(**kwargs)
-        for key in ("normalized_processing_time",):
-            result1.pop(key, None)
-            result2.pop(key, None)
         assert result1 == result2
 
     def test_no_sender_info(self):
@@ -1744,7 +1816,12 @@ class TestNormalizedLayerIntegration:
 
     @pytest.mark.asyncio
     async def test_raw_insert_creates_normalized_row(self, plugin_with_db):
-        raw = {"post_type": "message", "message_type": "private", "self_id": 123456}
+        raw = {
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": 123456,
+            "sender": {"user_id": "user_001", "nickname": "Alice"},
+        }
         event = self._make_event(raw_message=raw)
         await plugin_with_db.on_message_observed(event)
 
@@ -1782,6 +1859,132 @@ class TestNormalizedLayerIntegration:
         assert cursor.fetchone()[0] == 1
         cursor = plugin_with_db._conn.execute("SELECT COUNT(*) FROM normalized_events")
         assert cursor.fetchone()[0] == 1
+
+    def test_stored_raw_event_replay_is_fully_deterministic(self, plugin_with_db):
+        raw_event_id = _insert_raw_event(
+            plugin_with_db._conn,
+            "aiocqhttp_source",
+            "123456",
+            "source",
+            "message",
+            "event_001",
+            "msg_001",
+            "incoming",
+            "qq",
+            json.dumps(
+                {
+                    "message_type": "private",
+                    "time": 1234,
+                    "sender": {"user_id": "user_001", "nickname": "Alice"},
+                    "message": [{"type": "text", "data": {"text": "hello"}}],
+                }
+            ),
+            "payload-hash",
+            "fingerprint",
+            "event:aiocqhttp_source:123456:event_001",
+        )
+        assert raw_event_id is not None
+
+        assert _normalize_stored_raw_event(plugin_with_db._conn, raw_event_id)
+        first = plugin_with_db._conn.execute(
+            "SELECT * FROM normalized_events WHERE raw_event_id = ?",
+            (raw_event_id,),
+        ).fetchone()
+        assert not _normalize_stored_raw_event(plugin_with_db._conn, raw_event_id)
+        second = plugin_with_db._conn.execute(
+            "SELECT * FROM normalized_events WHERE raw_event_id = ?",
+            (raw_event_id,),
+        ).fetchone()
+
+        assert first == second
+        assert (
+            first[20]
+            == plugin_with_db._conn.execute(
+                "SELECT received_time FROM raw_events WHERE id = ?",
+                (raw_event_id,),
+            ).fetchone()[0]
+        )
+
+    def test_stored_raw_event_canonicalizes_unknown_direction(self, plugin_with_db):
+        raw_event_id = _insert_raw_event(
+            plugin_with_db._conn,
+            "aiocqhttp_source",
+            "123456",
+            "source",
+            "message",
+            "event_unknown_direction",
+            "msg_unknown_direction",
+            "unexpected-value",
+            "qq",
+            json.dumps(
+                {
+                    "message_type": "private",
+                    "sender": {"user_id": "user_001", "nickname": "Alice"},
+                }
+            ),
+            "payload-hash-unknown-direction",
+            "fingerprint-unknown-direction",
+            "event:aiocqhttp_source:123456:event_unknown_direction",
+        )
+        assert raw_event_id is not None
+
+        assert _normalize_stored_raw_event(plugin_with_db._conn, raw_event_id)
+        row = plugin_with_db._conn.execute(
+            "SELECT direction, actor_provenance, conversation_type "
+            "FROM normalized_events WHERE raw_event_id = ?",
+            (raw_event_id,),
+        ).fetchone()
+
+        assert row == ("unknown", "unknown", "unknown")
+
+    @pytest.mark.asyncio
+    async def test_duplicate_redelivery_recovers_missing_normalized_row(
+        self, plugin_with_db
+    ):
+        raw = {
+            "post_type": "message",
+            "message_type": "private",
+            "event_id": "recover_001",
+            "sender": {"user_id": "user_001", "nickname": "Alice"},
+        }
+        event = self._make_event(raw_message=raw)
+        with patch(
+            "astrbot.builtin_stars.qq_clone_observer.main._normalize_stored_raw_event",
+            side_effect=sqlite3.OperationalError("payload must not leak"),
+        ):
+            await plugin_with_db.on_message_observed(event)
+
+        assert (
+            plugin_with_db._conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert (
+            plugin_with_db._conn.execute(
+                "SELECT COUNT(*) FROM normalized_events"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            plugin_with_db.get_health()["aiocqhttp_source"]["last_rejection_or_error"]
+            == "normalization_error: OperationalError"
+        )
+
+        await plugin_with_db.on_message_observed(event)
+
+        assert (
+            plugin_with_db._conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert (
+            plugin_with_db._conn.execute(
+                "SELECT COUNT(*) FROM normalized_events"
+            ).fetchone()[0]
+            == 1
+        )
 
     @pytest.mark.asyncio
     async def test_incoming_group_normalized(self, plugin_with_db):
@@ -1879,7 +2082,15 @@ class TestNormalizedLayerIntegration:
     async def test_reply_target_in_normalized(self, plugin_with_db):
         from astrbot.core.message.components import Plain, Reply
 
-        raw = {"post_type": "message", "message_type": "private"}
+        raw = {
+            "post_type": "message",
+            "message_type": "private",
+            "sender": {"user_id": "user_001", "nickname": "Alice"},
+            "message": [
+                {"type": "reply", "data": {"id": "reply_001"}},
+                {"type": "text", "data": {"text": "hello"}},
+            ],
+        }
         event = self._make_event(
             raw_message=raw,
             segments=[Reply(id="reply_001"), Plain(text="hello")],
@@ -1898,7 +2109,7 @@ class TestNormalizedLayerIntegration:
             raw_message={"post_type": "message", "message_type": "private"},
         )
         with patch(
-            "astrbot.builtin_stars.qq_clone_observer.main._normalize_event",
+            "astrbot.builtin_stars.qq_clone_observer.main._normalize_stored_raw_event",
             side_effect=ValueError("invalid normalized event"),
         ):
             await plugin_with_db.on_message_observed(event)

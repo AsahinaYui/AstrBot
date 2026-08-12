@@ -8,8 +8,8 @@ observation-only and never sends messages or calls external services.
 
 import json
 import sqlite3
-import time
 from typing import Any
+from urllib.parse import quote
 
 from astrbot.core.message.components import (
     BaseMessageComponent,
@@ -19,6 +19,7 @@ from astrbot.core.message.components import (
 from astrbot.core.platform.astrbot_message import (
     AstrBotMessage,
     MessageDirection,
+    MessageMember,
     MessageType,
 )
 
@@ -193,6 +194,9 @@ def _build_conversation_id(
     Returns:
         A stable conversation ID string.
     """
+    encoded_platform_id = quote(str(platform_id), safe="")
+    encoded_self_id = quote(str(self_id), safe="")
+
     if conversation_type == "group":
         group_id = None
         if hasattr(message_obj, "group") and message_obj.group is not None:
@@ -204,13 +208,16 @@ def _build_conversation_id(
             except (AttributeError, TypeError):
                 pass
         if group_id:
-            return f"{platform_id}:{self_id}:g:{group_id}"
-        return f"{platform_id}:{self_id}:g:unknown"
+            return (
+                f"{encoded_platform_id}:{encoded_self_id}:g:"
+                f"{quote(str(group_id), safe='')}"
+            )
+        return f"{encoded_platform_id}:{encoded_self_id}:u:unknown"
 
     if conversation_type == "private":
         peer_id = None
         direction = getattr(message_obj, "direction", MessageDirection.UNKNOWN)
-        if direction == MessageDirection.OUTGOING:
+        if direction in (MessageDirection.OUTGOING, "outgoing"):
             # Outgoing: use target/user ID from raw_message
             if raw_message is not None and hasattr(raw_message, "get"):
                 try:
@@ -220,15 +227,18 @@ def _build_conversation_id(
                     peer_id = str(raw_peer_id) if raw_peer_id is not None else None
                 except (AttributeError, TypeError):
                     pass
-        else:
-            # Incoming or unknown: use sender ID
+        elif direction in (MessageDirection.INCOMING, "incoming"):
+            # Incoming: use sender ID
             if hasattr(message_obj, "sender") and message_obj.sender is not None:
                 peer_id = message_obj.sender.user_id
         if peer_id:
-            return f"{platform_id}:{self_id}:p:{peer_id}"
-        return f"{platform_id}:{self_id}:p:unknown"
+            return (
+                f"{encoded_platform_id}:{encoded_self_id}:p:"
+                f"{quote(str(peer_id), safe='')}"
+            )
+        return f"{encoded_platform_id}:{encoded_self_id}:u:unknown"
 
-    return f"{platform_id}:{self_id}:u:unknown"
+    return f"{encoded_platform_id}:{encoded_self_id}:u:unknown"
 
 
 def _derive_actor_provenance(
@@ -572,6 +582,7 @@ def _normalize_event(
     provenance: str | None,
     message_obj: AstrBotMessage,
     raw_message: Any,
+    normalized_processing_time: str | None = None,
 ) -> dict:
     """Normalize a raw event into a normalized fact record dict.
 
@@ -603,10 +614,27 @@ def _normalize_event(
         message_obj,
         raw_message,
     )
+    if conversation_id.endswith(":u:unknown"):
+        conversation_type = "unknown"
 
     sender_id = None
     sender_display_name = None
-    if hasattr(message_obj, "sender") and message_obj.sender is not None:
+    if raw_message is not None and hasattr(raw_message, "get"):
+        try:
+            raw_sender = raw_message.get("sender")
+            if isinstance(raw_sender, dict):
+                raw_sender_id = raw_sender.get("user_id")
+                sender_id = str(raw_sender_id) if raw_sender_id is not None else None
+                sender_display_name = (
+                    raw_sender.get("card") or raw_sender.get("nickname") or None
+                )
+        except (AttributeError, TypeError):
+            pass
+    if (
+        sender_id is None
+        and hasattr(message_obj, "sender")
+        and message_obj.sender is not None
+    ):
         sender_id = message_obj.sender.user_id
         sender_display_name = message_obj.sender.nickname
 
@@ -655,7 +683,9 @@ def _normalize_event(
         ),
         "reply_target_message_id": reply_target,
         "source_occurred_time": source_occurred_time,
-        "normalized_processing_time": str(int(time.time())),
+        "normalized_processing_time": normalized_processing_time
+        if normalized_processing_time is not None
+        else str(source_occurred_time or 0),
         "normalization_status": "normalized",
         "normalization_error": None,
     }
@@ -675,7 +705,7 @@ def _insert_normalized_event(
         True if a new row was inserted, False if duplicate was ignored.
     """
     cursor = conn.execute(
-        "INSERT OR IGNORE INTO normalized_events "
+        "INSERT INTO normalized_events "
         "(raw_event_id, parser_version, platform_id, self_id, account_role, "
         "source_event_type, source_event_id, source_message_id, "
         "conversation_type, conversation_id, sender_id, sender_display_name, "
@@ -683,7 +713,8 @@ def _insert_normalized_event(
         "normalized_segments_json, reply_target_message_id, "
         "source_occurred_time, normalized_processing_time, "
         "normalization_status, normalization_error) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(raw_event_id) DO NOTHING",
         (
             normalized["raw_event_id"],
             normalized["parser_version"],
@@ -711,3 +742,67 @@ def _insert_normalized_event(
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+def _normalize_stored_raw_event(
+    conn: sqlite3.Connection,
+    raw_event_id: int,
+) -> bool:
+    """Normalize one immutable raw row and store its derived fact.
+
+    Args:
+        conn: SQLite connection.
+        raw_event_id: Existing raw event row ID.
+
+    Returns:
+        True when a normalized row was inserted, or False when it already exists.
+
+    Raises:
+        ValueError: If the raw row is missing or its payload is not a JSON object.
+    """
+    cursor = conn.execute(
+        "SELECT platform_id, self_id, account_role, source_event_type, "
+        "source_event_id, source_message_id, message_direction, provenance, "
+        "payload_json, received_time FROM raw_events WHERE id = ?",
+        (raw_event_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise ValueError("raw event not found")
+
+    raw_message = json.loads(row[8])
+    if not isinstance(raw_message, dict):
+        raw_message = {}
+
+    message_obj = AstrBotMessage()
+    message_obj.direction = (
+        MessageDirection.OUTGOING
+        if row[6] == "outgoing"
+        else MessageDirection.INCOMING
+        if row[6] == "incoming"
+        else MessageDirection.UNKNOWN
+    )
+    direction = message_obj.direction.value
+    raw_sender = raw_message.get("sender")
+    if isinstance(raw_sender, dict) and raw_sender.get("user_id") is not None:
+        message_obj.sender = MessageMember(
+            user_id=str(raw_sender["user_id"]),
+            nickname=raw_sender.get("card") or raw_sender.get("nickname"),
+        )
+    message_obj.message = []
+
+    normalized = _normalize_event(
+        raw_event_id,
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        direction,
+        row[7],
+        message_obj,
+        raw_message,
+        normalized_processing_time=row[9],
+    )
+    return _insert_normalized_event(conn, normalized)

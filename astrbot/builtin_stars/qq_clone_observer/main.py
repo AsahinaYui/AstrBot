@@ -22,8 +22,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from ._normalized import (
     _build_normalized_schema,
-    _insert_normalized_event,
-    _normalize_event,
+    _normalize_stored_raw_event,
 )
 
 _PARSER_VERSION = "0.1.0"
@@ -300,6 +299,24 @@ def _check_existing_by_fingerprint(
     return cursor.fetchone() is not None
 
 
+def _find_raw_event_id(conn: sqlite3.Connection, idempotency_key: str) -> int | None:
+    """Find the immutable raw row for an idempotency key.
+
+    Args:
+        conn: SQLite connection.
+        idempotency_key: Canonical raw-event idempotency key.
+
+    Returns:
+        Raw row ID when present, otherwise None.
+    """
+    cursor = conn.execute(
+        "SELECT id FROM raw_events WHERE idempotency_key = ? LIMIT 1",
+        (idempotency_key,),
+    )
+    row = cursor.fetchone()
+    return int(row[0]) if row is not None else None
+
+
 class QQCloneObserver(Star):
     """Observes raw message events from configured source/clone QQ accounts.
 
@@ -501,10 +518,13 @@ class QQCloneObserver(Star):
 
         # Extract event metadata
         direction = getattr(message_obj, "direction", MessageDirection.UNKNOWN)
+        direction_value = (
+            direction.value if isinstance(direction, MessageDirection) else direction
+        )
         direction_str = (
-            direction.value
-            if isinstance(direction, MessageDirection)
-            else str(direction)
+            direction_value
+            if direction_value in {"incoming", "outgoing"}
+            else "unknown"
         )
         provenance = getattr(message_obj, "provenance", "unknown") or "unknown"
         source_message_id = getattr(message_obj, "message_id", None) or None
@@ -580,6 +600,34 @@ class QQCloneObserver(Star):
                 )
 
             if is_duplicate:
+                loop = asyncio.get_running_loop()
+                raw_event_id = await loop.run_in_executor(
+                    None,
+                    _find_raw_event_id,
+                    self._conn,
+                    idempotency_key,
+                )
+                if raw_event_id is not None:
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            _normalize_stored_raw_event,
+                            self._conn,
+                            raw_event_id,
+                        )
+                    except Exception as e:
+                        error_text = type(e).__name__
+                        logger.error(
+                            "QQCloneObserver: failed to replay normalization "
+                            "(raw_id=%s): %s",
+                            raw_event_id,
+                            error_text,
+                        )
+                        health = self._health.get(platform_id)
+                        if health:
+                            health["last_rejection_or_error"] = (
+                                f"normalization_error: {error_text}"
+                            )
                 # Update health state
                 health = self._health.get(platform_id)
                 if health:
@@ -609,6 +657,33 @@ class QQCloneObserver(Star):
                 )
                 if raw_event_id is None:
                     # DB-level duplicate (race condition safety net)
+                    existing_raw_event_id = await loop.run_in_executor(
+                        None,
+                        _find_raw_event_id,
+                        self._conn,
+                        idempotency_key,
+                    )
+                    if existing_raw_event_id is not None:
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                _normalize_stored_raw_event,
+                                self._conn,
+                                existing_raw_event_id,
+                            )
+                        except Exception as e:
+                            error_text = type(e).__name__
+                            logger.error(
+                                "QQCloneObserver: failed to replay normalization "
+                                "(raw_id=%s): %s",
+                                existing_raw_event_id,
+                                error_text,
+                            )
+                            health = self._health.get(platform_id)
+                            if health:
+                                health["last_rejection_or_error"] = (
+                                    f"normalization_error: {error_text}"
+                                )
                     health = self._health.get(platform_id)
                     if health:
                         health["duplicate_count"] += 1
@@ -629,37 +704,29 @@ class QQCloneObserver(Star):
             # Normalize immediately after raw insert succeeds
             try:
                 loop = asyncio.get_running_loop()
-                normalized = await loop.run_in_executor(
+                inserted = await loop.run_in_executor(
                     None,
-                    _normalize_event,
-                    raw_event_id,
-                    platform_id,
-                    self_id,
-                    role,
-                    source_event_type,
-                    source_event_id,
-                    source_message_id,
-                    direction_str,
-                    provenance,
-                    message_obj,
-                    raw_message,
-                )
-                await loop.run_in_executor(
-                    None,
-                    _insert_normalized_event,
+                    _normalize_stored_raw_event,
                     self._conn,
-                    normalized,
+                    raw_event_id,
                 )
+                if not inserted:
+                    raise sqlite3.IntegrityError(
+                        "normalized row already exists for new raw event"
+                    )
             except Exception as e:
+                error_text = type(e).__name__
                 logger.error(
                     "QQCloneObserver: failed to normalize event (raw_id=%s): %s",
                     raw_event_id,
-                    e,
+                    error_text,
                 )
                 # Record error in health but raw row is preserved
                 health = self._health.get(platform_id)
                 if health:
-                    health["last_rejection_or_error"] = f"normalization_error: {e}"
+                    health["last_rejection_or_error"] = (
+                        f"normalization_error: {error_text}"
+                    )
 
             # Update health state
             health = self._health.get(platform_id)
