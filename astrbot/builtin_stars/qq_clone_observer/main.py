@@ -10,15 +10,21 @@ import hashlib
 import json
 import sqlite3
 import time
+import weakref
 from pathlib import Path
 from typing import Any
+
+from aiocqhttp import Event
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star
 from astrbot.core import logger
-from astrbot.core.platform.astrbot_message import MessageDirection
+from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
+from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.command import GreedyStr
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from ._conversation import (
@@ -35,6 +41,7 @@ from ._mvp import (
     _store_shadow_draft,
 )
 from ._normalized import (
+    MessageDirection,
     _build_normalized_schema,
     _normalize_stored_raw_event,
 )
@@ -42,6 +49,38 @@ from ._normalized import (
 _PARSER_VERSION = "0.1.0"
 _DB_FILENAME = "raw_events.db"
 _DEFAULT_BURST_WINDOW_MS = 12000
+_ASTRBOT_SEND_MATCH_SECONDS = 5.0
+
+
+def _outgoing_signature(payload: dict, conversation_key: str) -> str | None:
+    """Build a short correlation signature for text-based outgoing messages.
+
+    Args:
+        payload: OneBot payload or an AstrBot result-shaped mapping.
+        conversation_key: Stable private-peer or group key.
+
+    Returns:
+        SHA-256 signature, or None when no text is available.
+    """
+    text = payload.get("text")
+    if not isinstance(text, str):
+        parts = []
+        segments = payload.get("message")
+        if isinstance(segments, list):
+            for segment in segments:
+                if (
+                    isinstance(segment, dict)
+                    and segment.get("type") == "text"
+                    and isinstance(segment.get("data"), dict)
+                ):
+                    value = segment["data"].get("text")
+                    if isinstance(value, str):
+                        parts.append(value)
+        text = "".join(parts)
+    text = text.strip()
+    if not text:
+        return None
+    return hashlib.sha256(f"{conversation_key}|{text}".encode()).hexdigest()
 
 
 def _safe_json_serialize(obj: Any, max_depth: int = 10) -> str:
@@ -397,6 +436,9 @@ class QQCloneObserver(Star):
             else _DEFAULT_BURST_WINDOW_MS
         )
         self._shadow_enabled = self._config.get("shadow_enabled", False) is True
+        self._subscriptions: dict[str, tuple[object, object]] = {}
+        self._pending_astrbot_sends: list[tuple[float, str, str, str]] = []
+        self._subscription_task: asyncio.Task | None = None
 
         # In-memory health state per platform_id
         self._health: dict[str, dict[str, Any]] = {}
@@ -419,6 +461,11 @@ class QQCloneObserver(Star):
 
         # Rebuild health state from configuration
         self._rebuild_health()
+        await self._refresh_napcat_subscriptions()
+        self._subscription_task = asyncio.create_task(
+            self._watch_napcat_subscriptions(),
+            name="qqclone_napcat_subscriptions",
+        )
 
         logger.info(
             "QQCloneObserver: SQLite database initialized at %s",
@@ -427,9 +474,203 @@ class QQCloneObserver(Star):
 
     async def terminate(self) -> None:
         """Close the SQLite connection."""
+        if self._subscription_task is not None:
+            self._subscription_task.cancel()
+            await asyncio.gather(self._subscription_task, return_exceptions=True)
+            self._subscription_task = None
+        self._unsubscribe_all()
         if self._conn is not None:
             await asyncio.to_thread(self._conn.close)
             self._conn = None
+
+    def _unsubscribe_all(self) -> None:
+        """Remove every raw NapCat callback registered by this plugin."""
+        for bot, callback in self._subscriptions.values():
+            bot._bus.unsubscribe("message_sent.self", callback)
+        self._subscriptions.clear()
+
+    async def _watch_napcat_subscriptions(self) -> None:
+        """Periodically reconcile adapter deletion and reload lifecycle changes."""
+        while True:
+            await asyncio.sleep(10)
+            await self._refresh_napcat_subscriptions()
+
+    async def _refresh_napcat_subscriptions(self) -> None:
+        """Reconcile configured aiocqhttp accounts with live adapter instances."""
+        accounts = self._config.get("accounts", [])
+        configured = {
+            str(item.get("platform_id"))
+            for item in accounts
+            if isinstance(item, dict)
+            and item.get("enabled", True)
+            and item.get("platform_id")
+        }
+        for platform_id, (bot, callback) in list(self._subscriptions.items()):
+            adapter = self.context.get_platform_inst(platform_id)
+            get_client = getattr(adapter, "get_client", None)
+            live_bot = get_client() if callable(get_client) else None
+            if platform_id not in configured or live_bot is not bot:
+                bot._bus.unsubscribe("message_sent.self", callback)
+                del self._subscriptions[platform_id]
+
+        owner_ref = weakref.ref(self)
+        for platform_id in configured - self._subscriptions.keys():
+            adapter = self.context.get_platform_inst(platform_id)
+            get_client = getattr(adapter, "get_client", None)
+            bot = get_client() if callable(get_client) else None
+            meta = adapter.meta() if adapter is not None else None
+            if bot is None or meta is None or meta.name != "aiocqhttp":
+                continue
+
+            async def callback(
+                event: Event,
+                subscribed_platform_id: str = platform_id,
+            ) -> None:
+                owner = owner_ref()
+                if owner is None:
+                    return
+                try:
+                    await owner._observe_napcat_outgoing(
+                        subscribed_platform_id,
+                        event,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "QQCloneObserver: outgoing capture failed for %s: %s",
+                        subscribed_platform_id,
+                        type(exc).__name__,
+                    )
+
+            bot._bus.subscribe("message_sent.self", callback)
+            self._subscriptions[platform_id] = (bot, callback)
+
+    @filter.on_platform_loaded()
+    async def on_platform_loaded(self) -> None:
+        """Refresh NapCat subscriptions after a platform load or reload."""
+        await self._refresh_napcat_subscriptions()
+
+    @filter.after_message_sent()
+    async def remember_astrbot_send(self, event: AstrMessageEvent) -> None:
+        """Remember a recent AstrBot send only for provenance correlation.
+
+        Args:
+            event: Event whose result was dispatched by AstrBot.
+        """
+        role, _, _ = self._resolve_account_role(
+            event.get_platform_id(),
+            event.get_self_id(),
+        )
+        result = event.get_result()
+        if role is None or result is None:
+            return
+        signature = _outgoing_signature(
+            {"text": result.get_plain_text()},
+            event.unified_msg_origin,
+        )
+        if signature is None:
+            return
+        now = time.monotonic()
+        self._pending_astrbot_sends = [
+            item
+            for item in self._pending_astrbot_sends
+            if now - item[0] <= _ASTRBOT_SEND_MATCH_SECONDS
+        ]
+        self._pending_astrbot_sends.append(
+            (now, event.get_platform_id(), event.get_self_id(), signature)
+        )
+
+    async def _observe_napcat_outgoing(
+        self,
+        platform_id: str,
+        event: Event,
+    ) -> None:
+        """Capture one NapCat ``message_sent.self`` final platform fact.
+
+        Args:
+            platform_id: Subscribed aiocqhttp platform ID.
+            event: Raw NapCat outgoing event.
+        """
+        payload = dict(event)
+        if payload.get("message_sent_type") != "self":
+            return
+        self_id = str(payload.get("self_id") or "")
+        role, _, rejection = self._resolve_account_role(platform_id, self_id)
+        if role is None:
+            if rejection:
+                logger.warning(
+                    "QQCloneObserver: rejected outgoing event from %s/%s: %s",
+                    platform_id,
+                    self_id,
+                    rejection,
+                )
+            return
+
+        message_type = payload.get("message_type")
+        if message_type == "private":
+            peer = payload.get("target_id")
+            if peer is None:
+                logger.warning(
+                    "QQCloneObserver: private outgoing event from %s lacks target_id",
+                    platform_id,
+                )
+                return
+            session_id = str(peer)
+            message_type_value = MessageType.FRIEND_MESSAGE
+            conversation_key = str(
+                MessageSession(platform_id, message_type_value, session_id)
+            )
+        elif message_type == "group" and payload.get("group_id") is not None:
+            session_id = str(payload["group_id"])
+            message_type_value = MessageType.GROUP_MESSAGE
+            conversation_key = str(
+                MessageSession(platform_id, message_type_value, session_id)
+            )
+        else:
+            logger.warning(
+                "QQCloneObserver: outgoing event from %s has no usable conversation",
+                platform_id,
+            )
+            return
+
+        signature = _outgoing_signature(payload, conversation_key)
+        now = time.monotonic()
+        matched_astrbot = False
+        remaining = []
+        for item in self._pending_astrbot_sends:
+            if now - item[0] > _ASTRBOT_SEND_MATCH_SECONDS:
+                continue
+            if (
+                not matched_astrbot
+                and item[1] == platform_id
+                and item[2] == self_id
+                and signature is not None
+                and item[3] == signature
+            ):
+                matched_astrbot = True
+                continue
+            remaining.append(item)
+        self._pending_astrbot_sends = remaining
+
+        message_obj = AstrBotMessage()
+        message_obj.self_id = self_id
+        message_obj.message_id = str(payload.get("message_id") or "")
+        message_obj.type = message_type_value
+        message_obj.session_id = session_id
+        message_obj.raw_message = payload
+        message_obj.timestamp = int(payload.get("time") or time.time())
+        message_obj.sender = MessageMember(self_id, "self")
+        message_obj.message = []
+        message_obj.message_str = ""
+        if message_type_value == MessageType.GROUP_MESSAGE:
+            message_obj.group = Group(session_id)
+
+        await self._capture_message(
+            message_obj,
+            platform_id,
+            self_id,
+            MessageDirection.OUTGOING.value,
+            "astrbot_after_send" if matched_astrbot else "napcat_message_sent",
+        )
 
     def _rebuild_health(self) -> None:
         """Rebuild in-memory health state from current configuration."""
@@ -635,19 +876,76 @@ class QQCloneObserver(Star):
 
         return None, None, "unknown platform_id"
 
-    @filter.on_message_observed()
-    async def on_message_observed(self, event: AstrMessageEvent) -> None:
-        """Handle observed messages from all configured accounts.
-
-        This is the main observation handler. It resolves the account role,
-        performs identity checks, deduplicates, and persists the raw event.
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def observe_incoming(self, event: AstrMessageEvent) -> None:
+        """Capture an incoming aiocqhttp event without changing its flow.
 
         Args:
-            event: The observed message event.
+            event: Incoming AstrBot message event.
         """
-        message_obj = event.message_obj
-        platform_id = event.get_platform_id()
-        self_id = event.get_self_id()
+        role, _, _ = self._resolve_account_role(
+            event.get_platform_id(),
+            event.get_self_id(),
+        )
+        if role is None or not await SessionPluginManager.is_plugin_enabled_for_session(
+            event.unified_msg_origin,
+            "qq_clone_observer",
+        ):
+            return
+        event.should_call_llm(True)
+        await self._capture_message(
+            event.message_obj,
+            event.get_platform_id(),
+            event.get_self_id(),
+            MessageDirection.INCOMING.value,
+            "astrbot_incoming",
+            event.unified_msg_origin,
+        )
+
+    async def on_message_observed(self, event: AstrMessageEvent) -> None:
+        """Compatibility entry for direct callers; not registered as a hook.
+
+        Args:
+            event: Incoming aiocqhttp event.
+        """
+        raw_message = event.message_obj.raw_message
+        outgoing = (
+            isinstance(raw_message, dict)
+            and raw_message.get("post_type") == "message_sent"
+        )
+        await self._capture_message(
+            event.message_obj,
+            event.get_platform_id(),
+            event.get_self_id(),
+            (
+                MessageDirection.OUTGOING.value
+                if outgoing
+                else MessageDirection.INCOMING.value
+            ),
+            "napcat_message_sent" if outgoing else "astrbot_incoming",
+            getattr(event, "unified_msg_origin", None),
+        )
+
+    async def _capture_message(
+        self,
+        message_obj: AstrBotMessage,
+        platform_id: str,
+        self_id: str,
+        direction_str: str,
+        source: str,
+        unified_msg_origin: str | None = None,
+    ) -> None:
+        """Validate, deduplicate, store, and process one QQClone fact.
+
+        Args:
+            message_obj: Message with raw OneBot payload.
+            platform_id: Configured aiocqhttp platform ID.
+            self_id: Observed QQ self ID.
+            direction_str: QQClone-local incoming or outgoing direction.
+            source: Finite QQClone source label.
+            unified_msg_origin: Optional provider-routing origin for clone drafts.
+        """
 
         # Resolve account role from configuration (fail-closed)
         role, expected_self_id, rejection_reason = self._resolve_account_role(
@@ -685,22 +983,8 @@ class QQCloneObserver(Star):
                 )
             return
 
-        # Configured QQClone accounts never enter AstrBot's normal reply
-        # pipeline. Administrators use the review commands from another local
-        # AstrBot surface, such as WebChat.
-        event.stop_event()
-
-        # Extract event metadata
-        direction = getattr(message_obj, "direction", MessageDirection.UNKNOWN)
-        direction_value = (
-            direction.value if isinstance(direction, MessageDirection) else direction
-        )
-        direction_str = (
-            direction_value
-            if direction_value in {"incoming", "outgoing"}
-            else "unknown"
-        )
-        provenance = getattr(message_obj, "provenance", "unknown") or "unknown"
+        if direction_str not in {"incoming", "outgoing"}:
+            return
         source_message_id = getattr(message_obj, "message_id", None) or None
 
         # Determine source event type
@@ -732,7 +1016,7 @@ class QQCloneObserver(Star):
             platform_id,
             self_id,
             direction_str,
-            provenance,
+            source,
             payload_sha256,
         )
         if source_event_id:
@@ -825,7 +1109,7 @@ class QQCloneObserver(Star):
                     source_event_id,
                     source_message_id,
                     direction_str,
-                    provenance,
+                    source,
                     payload_json,
                     payload_sha256,
                     stable_fingerprint,
@@ -916,10 +1200,11 @@ class QQCloneObserver(Star):
             normalized_event_id is not None
             and role == "clone"
             and direction_str == "incoming"
+            and unified_msg_origin is not None
         ):
             await self._generate_shadow_draft(
                 normalized_event_id,
-                event.unified_msg_origin,
+                unified_msg_origin,
             )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

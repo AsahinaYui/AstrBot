@@ -14,9 +14,12 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiocqhttp import Event
+from aiocqhttp.bus import EventBus
 
 from astrbot.builtin_stars.qq_clone_observer._normalized import (
     _build_conversation_id,
@@ -47,6 +50,7 @@ from astrbot.core.platform.astrbot_message import (
     MessageMember,
     MessageType,
 )
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 
 class TestSafeJsonSerialize:
@@ -597,7 +601,7 @@ class TestHealthTracking:
         assert rows[0][4] == "message"
         assert rows[0][6] == "msg_001"
         assert rows[0][7] == "incoming"
-        assert rows[0][8] == "qq"
+        assert rows[0][8] == "astrbot_incoming"
 
         health = plugin_with_db.get_health()
         assert health["aiocqhttp_source"]["accepted_count"] == 1
@@ -660,6 +664,58 @@ class TestHealthTracking:
         event.send_streaming.assert_not_called()
         event.plain_result.assert_not_called()
         event.make_result.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_napcat_event_bus_uses_private_target_id(self, plugin_with_db):
+        bus = EventBus()
+        bot = SimpleNamespace(_bus=bus)
+        adapter = SimpleNamespace(
+            get_client=lambda: bot,
+            meta=lambda: SimpleNamespace(name="aiocqhttp"),
+        )
+        plugin_with_db.context.get_platform_inst.return_value = adapter
+
+        await plugin_with_db._refresh_napcat_subscriptions()
+        await plugin_with_db._refresh_napcat_subscriptions()
+        event = Event.from_payload(
+            {
+                "post_type": "message_sent",
+                "message_sent_type": "self",
+                "message_type": "private",
+                "self_id": 123456,
+                "user_id": 123456,
+                "target_id": 654321,
+                "message_id": "sent-1",
+                "time": 123,
+                "message": [{"type": "text", "data": {"text": "hello"}}],
+            }
+        )
+
+        assert event is not None and event.name == "message_sent.self"
+        await bus.emit(event.name, event)
+
+        row = plugin_with_db._conn.execute(
+            "SELECT direction, conversation_id FROM normalized_events"
+        ).fetchone()
+        assert row == ("outgoing", "aiocqhttp_source:123456:p:654321")
+        assert len(bus._subscribers["message_sent.self"]) == 1
+        plugin_with_db._unsubscribe_all()
+        assert not bus._subscribers["message_sent.self"]
+
+    @pytest.mark.asyncio
+    async def test_incoming_capture_does_not_stop_or_send(self, plugin_with_db):
+        event = self._make_event(raw_message={"post_type": "message"})
+        event.unified_msg_origin = "aiocqhttp:FriendMessage:user_001"
+        with patch.object(
+            SessionPluginManager,
+            "is_plugin_enabled_for_session",
+            new=AsyncMock(return_value=True),
+        ):
+            await plugin_with_db.observe_incoming(event)
+
+        event.should_call_llm.assert_called_once_with(True)
+        event.stop_event.assert_not_called()
+        event.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_raw_message_serializes_safely(self, plugin_with_db):
@@ -1272,7 +1328,11 @@ class TestConversationIdBuilding:
         msg.direction = MessageDirection.OUTGOING
         msg.sender = MessageMember(user_id="user_001")
         cid = _build_conversation_id(
-            "p1", "bot1", "private", msg, {"user_id": "target_001"}
+            "p1",
+            "bot1",
+            "private",
+            msg,
+            {"user_id": "bot1", "target_id": "target_001"},
         )
         assert cid == "p1:bot1:p:target_001"
 
@@ -1424,7 +1484,12 @@ class TestNormalizeEvent:
 
     def test_outgoing_private_normalization(self):
         msg = self._make_message_obj(direction=MessageDirection.OUTGOING)
-        raw = {"message_type": "private", "user_id": "target_001", "time": 999}
+        raw = {
+            "message_type": "private",
+            "user_id": "bot1",
+            "target_id": "target_001",
+            "time": 999,
+        }
         result = _normalize_event(
             1,
             "p1",

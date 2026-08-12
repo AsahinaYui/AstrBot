@@ -1649,7 +1649,7 @@ class TestPluginIntegration:
         event.make_result = MagicMock()
         await plugin_with_db.on_message_observed(event)
 
-        event.stop_event.assert_called_once()
+        event.stop_event.assert_not_called()
         event.send.assert_not_called()
         event.send_streaming.assert_not_called()
         event.plain_result.assert_not_called()

@@ -8,6 +8,7 @@ observation-only and never sends messages or calls external services.
 
 import json
 import sqlite3
+from enum import Enum
 from typing import Any
 from urllib.parse import quote
 
@@ -18,12 +19,20 @@ from astrbot.core.message.components import (
 )
 from astrbot.core.platform.astrbot_message import (
     AstrBotMessage,
-    MessageDirection,
     MessageMember,
     MessageType,
 )
 
 _NORMALIZED_PARSER_VERSION = "0.1.0"
+
+
+class MessageDirection(str, Enum):
+    """Message direction scoped to QQClone storage facts."""
+
+    UNKNOWN = "unknown"
+    INCOMING = "incoming"
+    OUTGOING = "outgoing"
+
 
 # Known OneBot segment types mapped to stable normalized kinds
 _KNOWN_SEGMENT_KINDS = {
@@ -47,7 +56,7 @@ _KNOWN_SEGMENT_KINDS = {
     ComponentType.Unknown: "unknown",
 }
 
-_AGENT_PROVENANCE = {"agent", "generated"}
+_AGENT_PROVENANCE = {"agent", "generated", "astrbot_after_send"}
 _NON_HUMAN_PROVENANCE = _AGENT_PROVENANCE | {"imported", "forward", "forwarded"}
 _KNOWN_RAW_SEGMENT_KINDS = {
     "text",
@@ -218,12 +227,10 @@ def _build_conversation_id(
         peer_id = None
         direction = getattr(message_obj, "direction", MessageDirection.UNKNOWN)
         if direction in (MessageDirection.OUTGOING, "outgoing"):
-            # Outgoing: use target/user ID from raw_message
+            # NapCat's outgoing private peer is target_id; user_id may be self.
             if raw_message is not None and hasattr(raw_message, "get"):
                 try:
-                    raw_peer_id = raw_message.get("user_id")
-                    if raw_peer_id is None:
-                        raw_peer_id = raw_message.get("target_id")
+                    raw_peer_id = raw_message.get("target_id")
                     peer_id = str(raw_peer_id) if raw_peer_id is not None else None
                 except (AttributeError, TypeError):
                     pass

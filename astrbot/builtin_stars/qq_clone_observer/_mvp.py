@@ -147,7 +147,7 @@ def _capture_human_example(
         except (json.JSONDecodeError, TypeError):
             payload = {}
         if isinstance(payload, dict):
-            raw_subject = payload.get("user_id") or payload.get("target_id")
+            raw_subject = payload.get("target_id")
             if raw_subject is not None:
                 subject_id = str(raw_subject)
 

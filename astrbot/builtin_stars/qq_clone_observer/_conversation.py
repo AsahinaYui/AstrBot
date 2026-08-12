@@ -831,7 +831,11 @@ def _ensure_relationship_for_normalized(
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        raw_subject = payload.get("user_id") or payload.get("target_id")
+        raw_subject = (
+            payload.get("target_id")
+            if direction == "outgoing"
+            else payload.get("user_id")
+        )
         subject_id = str(raw_subject) if raw_subject is not None else None
 
     if (
