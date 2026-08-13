@@ -42,6 +42,7 @@ from astrbot.builtin_stars.qq_clone_observer._conversation import (
     _update_relationship_profile,
 )
 from astrbot.builtin_stars.qq_clone_observer._normalized import (
+    MessageDirection,
     _insert_normalized_event,
     _normalize_stored_raw_event,
 )
@@ -52,7 +53,6 @@ from astrbot.builtin_stars.qq_clone_observer.main import (
 )
 from astrbot.core.platform.astrbot_message import (
     AstrBotMessage,
-    MessageDirection,
     MessageMember,
     MessageType,
 )

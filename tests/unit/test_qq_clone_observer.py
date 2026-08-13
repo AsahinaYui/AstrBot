@@ -22,6 +22,7 @@ from aiocqhttp import Event
 from aiocqhttp.bus import EventBus
 
 from astrbot.builtin_stars.qq_clone_observer._normalized import (
+    MessageDirection,
     _build_conversation_id,
     _build_normalized_schema,
     _derive_actor_provenance,
@@ -46,7 +47,6 @@ from astrbot.builtin_stars.qq_clone_observer.main import (
 from astrbot.core.platform.astrbot_message import (
     AstrBotMessage,
     Group,
-    MessageDirection,
     MessageMember,
     MessageType,
 )
